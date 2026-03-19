@@ -74,22 +74,18 @@ draw_title
 
 draw_game_list
  ;
- ; Display available games
+ ; Display available games.
+ ; M1 fallback: use static names until dynamic SD header scan fills $6000 table.
  ;
- ; plotchars 'ASTRO WING'       0 10 4
- ; plotchars 'DONKEY KONG'       0 10 6
- ; plotchars 'GALAGA'           0 10 8
- ; plotchars 'MS PAC-MAN'       0 10 10
- ; plotchars 'DEFENDER'         0 10 12
-  plotchars $6000 0 10 4
-  plotchars $6020 0 10 5
-  plotchars $6040 0 10 6
-  plotchars $6060 0 10 7
-  plotchars $6080 0 10 8
-  plotchars $60A0 0 10 9
-  plotchars $60C0 0 10 10
-  plotchars $60E0 0 10 11
-  plotchars $6100 0 10 12
+  plotchars 'ASTRO WING'          0 10 4
+  plotchars 'CHOPLIFTER'          0 10 5
+  plotchars 'ARTI'                0 10 6
+  plotchars 'COMMANDO'            0 10 7
+  plotchars 'IMPOSSIBLE MISSION'  0 10 8
+  plotchars 'FOOD FIGHT'          0 10 9
+  plotchars 'TIGER HELI'          0 10 10
+  plotchars 'JINKS'               0 10 11
+  plotchars 'RIGHT+FIRE RELOAD'   0 10 12
 
  return
 

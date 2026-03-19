@@ -109,8 +109,22 @@ fi
 echo "Copying bitstream to project directory..."
 BITSTREAM_PATH="$GOWIN_IDE/impl/pnr/Atari7800_AstroCart.fs"
 if [ -f "$BITSTREAM_PATH" ]; then
-    cp "$BITSTREAM_PATH" "$PROJECT_DIR/"
-    echo -e "${GREEN}✓ Bitstream copied to Atari7800_AstroCart.fs${NC}"
+    TARGET_BITSTREAM="$PROJECT_DIR/Atari7800_AstroCart.fs"
+
+    # Some previous runs may leave a read-only target (-r-xr-xr-x), which
+    # makes plain cp fail with "Permission denied".
+    if [ -f "$TARGET_BITSTREAM" ] && [ ! -w "$TARGET_BITSTREAM" ]; then
+        chmod u+w "$TARGET_BITSTREAM" 2>/dev/null || true
+    fi
+
+    if cp "$BITSTREAM_PATH" "$TARGET_BITSTREAM"; then
+        echo -e "${GREEN}✓ Bitstream copied to Atari7800_AstroCart.fs${NC}"
+    else
+        TMP_BITSTREAM="$PROJECT_DIR/.Atari7800_AstroCart.fs.tmp"
+        cp "$BITSTREAM_PATH" "$TMP_BITSTREAM"
+        mv -f "$TMP_BITSTREAM" "$TARGET_BITSTREAM"
+        echo -e "${GREEN}✓ Bitstream replaced via temp file (read-only target workaround)${NC}"
+    fi
 else
     echo -e "${YELLOW}Warning: Bitstream file not found at expected location${NC}"
 fi
