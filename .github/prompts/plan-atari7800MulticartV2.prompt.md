@@ -8,6 +8,10 @@ Build a stable V2 multicart baseline on Tang 9K by reusing proven low-level bloc
 1. M1 started.
 1. M1 foundation HDL added: top.v, sd_controller.v, psram_controller.v, gowin_pll.v.
 1. M1 synthesis smoke test passed and generated Atari7800_AstroCart.fs.
+1. M2 integration started: proven loader/handoff modules ported from previous project baseline.
+1. M2 integration build passed and generated Atari7800_AstroCart.fs for board validation.
+1. Hardware validation: AstroWing boots and runs from menu selection.
+1. Hardware validation: Choplifter selection loads quickly and game runs.
 
 **Phase-By-Phase Execution Checklist (Entry/Exit Gates)**
 
