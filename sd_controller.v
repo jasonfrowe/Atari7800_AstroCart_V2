@@ -40,6 +40,11 @@ module sd_controller(
     output reg [7:0] recv_data
 );
 
+    // Cross-domain command inputs (rd/wr) are driven by clk_sys logic.
+    // Synchronize them into the SD controller clock domain before use.
+    reg rd_r1, rd_s;
+    reg wr_r1, wr_s;
+
     parameter RST = 0;
     parameter INIT = 1;
     parameter CMD0 = 2;
@@ -97,11 +102,19 @@ module sd_controller(
             slow_div <= 0;
             fast_div <= 0;
             high_speed_mode <= 0;
+            rd_r1 <= 0;
+            rd_s <= 0;
+            wr_r1 <= 0;
+            wr_s <= 0;
         end else begin
             slow_div <= slow_div + 1;
             fast_div <= fast_div + 1;
             // Robust Switch: Init states are < 6. IDLE is 6. Read/Write > 6.
             if (state >= 6) high_speed_mode <= 1; 
+            rd_r1 <= rd;
+            rd_s <= rd_r1;
+            wr_r1 <= wr;
+            wr_s <= wr_r1;
         end
     end
     
@@ -208,10 +221,10 @@ module sd_controller(
                 end
                 IDLE: begin
                     byte_available <= 0;
-                    if(rd == 1) begin
+                    if(rd_s == 1) begin
                         state <= READ_BLOCK;
                     end
-                    else if(wr == 1) begin
+                    else if(wr_s == 1) begin
                         state <= WRITE_BLOCK_CMD;
                     end
                     else begin
@@ -242,7 +255,7 @@ module sd_controller(
                 READ_BLOCK_DATA: begin
                     dout <= recv_data;
                     byte_available <= 1;
-                    if (rd) begin // Flow Control: Only proceed if Host is ready
+                    if (rd_s) begin // Flow Control: Only proceed if Host is ready
                         if (byte_counter == 0) begin
                             bit_counter <= 7;
                             return_state <= READ_BLOCK_CRC;

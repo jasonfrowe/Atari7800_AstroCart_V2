@@ -74,36 +74,31 @@ draw_title
 
 draw_game_list
  ;
- ; Display available games.
- ; M1 fallback: use static names until dynamic SD header scan fills $6000 table.
+ ; Display available games
  ;
-  plotchars 'ASTRO WING'          0 10 4
-  plotchars 'CHOPLIFTER'          0 10 5
-  plotchars 'ARTI'                0 10 6
-  plotchars 'COMMANDO'            0 10 7
-  plotchars 'IMPOSSIBLE MISSION'  0 10 8
-  plotchars 'FOOD FIGHT'          0 10 9
-  plotchars 'TIGER HELI'          0 10 10
-  plotchars 'JINKS'               0 10 11
-  plotchars 'RIGHT+FIRE RELOAD'   0 10 12
+ ; plotchars 'ASTRO WING'       0 10 4
+ ; plotchars 'DONKEY KONG'       0 10 6
+ ; plotchars 'GALAGA'           0 10 8
+ ; plotchars 'MS PAC-MAN'       0 10 10
+ ; plotchars 'DEFENDER'         0 10 12
+  plotchars $6000 0 10 4
+  plotchars $6020 0 10 5
+  plotchars $6040 0 10 6
+  plotchars $6060 0 10 7
+  plotchars $6080 0 10 8
+  plotchars $60A0 0 10 9
+  plotchars $60C0 0 10 10
+  plotchars $60E0 0 10 11
 
  return
 
 draw_hud
- ; plotchars $7F00 1 10 13 14
- ; plotchars $7F10 1 80 13 14
- ; plotchars $7F20 1 10 14 14
- ; plotchars $7F30 1 80 14 14
- ; plotchars $7F40 1 10 15 14
- ; plotchars $7F50 1 80 15 14
- ; plotchars $7F60 1 10 16 14
- ; plotchars $7F70 1 80 16 14
- ; plotchars $7F80 1 10 17 14
- ; plotchars $7F90 1 80 17 14
- ; plotchars $7FA0 1 10 18 14
- ; plotchars $7FB0 1 80 18 14
- ; plotchars $7FC0 1 10 19 14
- ; plotchars $7FD0 1 80 19 14
+ plotchars 'SD:' 1 10 12
+ plotchars $6100 1 40 12
+ plotchars 'P1:' 1 10 13
+ plotchars $6110 1 40 13
+ plotchars 'P2:' 1 10 14
+ plotchars $6120 1 40 14
  return
 
 
@@ -184,13 +179,20 @@ flash_loop
 wait_loop
  restorescreen
  gosub draw_hud
+ plotchars 'LOADING...' 1 96 14
  drawscreen
+ status_temp = 0
  asm
    lda $7FF0
-   bpl .keep_waiting
-   lda #$A5
-   sta $2200
-   jmp ($FFFC)
-.keep_waiting
+   sta status_temp
 end
- goto wait_loop
+ if status_temp < 128 then goto wait_loop
+
+inspect_loop
+ restorescreen
+ gosub draw_hud
+ plotchars 'LOAD DONE' 1 96 14
+ plotchars 'COMMANDO TEST' 1 72 16
+ plotchars 'POWER CYCLE TO EXIT' 1 40 18
+ drawscreen
+ goto inspect_loop

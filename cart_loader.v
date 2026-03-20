@@ -21,6 +21,10 @@ module cart_loader (
     output reg   psram_wr_req,
     output reg [22:0] psram_write_addr_latched,
     output reg [15:0] acc_word0,
+    output reg        psram_diag_rd_req,
+    output reg [21:0] psram_diag_rd_addr,
+    input      [15:0] psram_diag_rd_data,
+    input             psram_diag_rd_valid,
     
     // Status outputs
     output reg   game_loaded,
@@ -90,11 +94,14 @@ module cart_loader (
     // -----------------------------------------------------------------------
     reg sd_ready_r1, sd_ready_s;    // synchronized sd_ready
     reg sd_ba_r1,    sd_ba_s;       // synchronized sd_byte_available
+    reg [7:0] sd_dout_r1, sd_dout_s; // synchronized sd_dout bus
     always @(posedge clk_sys) begin
         sd_ready_r1 <= sd_ready;
         sd_ready_s  <= sd_ready_r1;
         sd_ba_r1    <= sd_byte_available;
         sd_ba_s     <= sd_ba_r1;
+        sd_dout_r1  <= sd_dout;
+        sd_dout_s   <= sd_dout_r1;
     end
 
     // Simplified Sequential Loader
@@ -104,20 +111,37 @@ module cart_loader (
     localparam SD_DATA       = 3;
     localparam SD_NEXT       = 4;
     localparam SD_COMPLETE   = 5;
+    localparam SD_CSUM_WRITE = 6;
+    localparam SD_CSUM_NEXT  = 7;
+    localparam SD_VERIFY_START = 8;
     localparam SD_DRAIN      = 9; // Wait for last PSRAM write to commit
     
     localparam SD_SCAN_START = 10;
     localparam SD_SCAN_WAIT  = 11;
     localparam SD_SCAN_DATA  = 12;
     localparam SD_SCAN_NEXT  = 13;
+    localparam SD_VERIFY_WAIT = 14;
+
+    // Diagnostic mode: keep the menu resident and never hand off into PSRAM.
+    localparam DISABLE_GAME_HANDOFF = 1'b1;
 
     // Internal tracking registers
     reg [9:0] current_sector;
     reg [9:0] byte_index;
 
     reg [7:0] sd_dout_reg;
+    reg [7:0] payload_lo_byte;
     reg [22:0] psram_load_addr;
+    reg [22:0] load_base_addr;
     reg [7:0] d_latched;
+    reg [31:0] load_checksum;
+    reg [31:0] psram_checksum;
+    reg [31:0] psram_checksum_pass1;
+    reg [31:0] verify_total_bytes;
+    reg verify_pass;
+    reg [3:0] checksum_char_idx;
+    reg [31:0] verify_bytes_left;
+    reg [1:0] checksum_write_phase;
     
     // Address-based data capture logic
     reg trigger_we_prev;
@@ -140,6 +164,49 @@ module cart_loader (
     reg [9:0] sector_limit;
 
     wire [31:0] size_be_wire = {h49, h50, h51, h52}; // Always BE per .a78 spec
+    wire write_inflight = write_pending || psram_wr_req;
+
+    function [7:0] to_hex_ascii;
+        input [3:0] nibble;
+        begin
+            case (nibble)
+                4'h0: to_hex_ascii = "0";
+                4'h1: to_hex_ascii = "1";
+                4'h2: to_hex_ascii = "2";
+                4'h3: to_hex_ascii = "3";
+                4'h4: to_hex_ascii = "4";
+                4'h5: to_hex_ascii = "5";
+                4'h6: to_hex_ascii = "6";
+                4'h7: to_hex_ascii = "7";
+                4'h8: to_hex_ascii = "8";
+                4'h9: to_hex_ascii = "9";
+                4'hA: to_hex_ascii = "A";
+                4'hB: to_hex_ascii = "B";
+                4'hC: to_hex_ascii = "C";
+                4'hD: to_hex_ascii = "D";
+                4'hE: to_hex_ascii = "E";
+                default: to_hex_ascii = "F";
+            endcase
+        end
+    endfunction
+
+    function [7:0] checksum_char;
+        input [31:0] value;
+        input [3:0] idx;
+        begin
+            case (idx)
+                4'd0: checksum_char = to_hex_ascii(value[31:28]);
+                4'd1: checksum_char = to_hex_ascii(value[27:24]);
+                4'd2: checksum_char = to_hex_ascii(value[23:20]);
+                4'd3: checksum_char = to_hex_ascii(value[19:16]);
+                4'd4: checksum_char = to_hex_ascii(value[15:12]);
+                4'd5: checksum_char = to_hex_ascii(value[11:8]);
+                4'd6: checksum_char = to_hex_ascii(value[7:4]);
+                4'd7: checksum_char = to_hex_ascii(value[3:0]);
+                default: checksum_char = 8'h00;
+            endcase
+        end
+    endfunction
 
     always @(posedge clk_sys) begin
         if (reset) begin
@@ -151,6 +218,8 @@ module cart_loader (
              switch_pending <= 0;
              psram_wr_req <= 0;
              acc_word0 <= 0;
+             psram_diag_rd_req <= 0;
+             psram_diag_rd_addr <= 0;
              write_pending <= 0;
              busy <= 1; // Busy during initial scan
              
@@ -160,8 +229,18 @@ module cart_loader (
              
              current_sector <= 0;
              psram_load_addr <= 23'h000000;
+             load_base_addr <= 23'h000000;
              sd_dout_reg <= 0;
+             payload_lo_byte <= 0;
              drain_timer <= 0;
+             load_checksum <= 32'h00000000;
+             psram_checksum <= 32'h00000000;
+                         psram_checksum_pass1 <= 32'h00000000;
+             verify_total_bytes <= 32'h00000000;
+                         verify_pass <= 0;
+             checksum_char_idx <= 0;
+                         checksum_write_phase <= 0;
+             verify_bytes_left <= 0;
              
              scan_game_idx <= 0;
              bram_we <= 0;
@@ -176,9 +255,11 @@ module cart_loader (
              cart_sgm_fixed_bank <= 4'd15; // default: bank 15 (256KB)
              sector_limit <= 10'd96;      // will be overwritten in SD_NEXT
         end else begin
+                         bram_we <= 0;
+                         psram_diag_rd_req <= 0;
              trigger_we_prev <= trigger_we;
              
-             if (psram_wr_req) begin
+               if (psram_wr_req) begin
                   psram_wr_req <= 0;
               end else if (write_pending && !psram_busy) begin
                    // [FIX] Gate writes when game loaded to prevent corruption
@@ -222,6 +303,14 @@ module cart_loader (
                             sd_state <= SD_START;
                             busy <= 1;
                             psram_load_addr <= 0;
+                            load_base_addr <= 23'h000000;
+                            load_checksum <= 32'h00000000;
+                            psram_checksum <= 32'h00000000;
+                                     psram_checksum_pass1 <= 32'h00000000;
+                                     verify_pass <= 0;
+                            checksum_char_idx <= 0;
+                                     checksum_write_phase <= 0;
+                            verify_bytes_left <= 0;
                             
                             cart_rom_size <= 49152;
                             cart_has_pokey <= 1;
@@ -239,6 +328,14 @@ module cart_loader (
                              busy <= 1;
                              game_loaded <= 0;
                              switch_pending <= 0;
+                                 load_base_addr <= 23'h000000;
+                                 load_checksum <= 32'h00000000;
+                                 psram_checksum <= 32'h00000000;
+                                 psram_checksum_pass1 <= 32'h00000000;
+                                 verify_pass <= 0;
+                                 checksum_char_idx <= 0;
+                                 checksum_write_phase <= 0;
+                                 verify_bytes_left <= 0;
                         end
                         else if (d_latched == 8'h40) begin
                              sd_address <= 1;
@@ -248,6 +345,14 @@ module cart_loader (
                              busy <= 1;
                              game_loaded <= 0;
                              switch_pending <= 0;
+                             load_base_addr <= 23'h000000;
+                             load_checksum <= 32'h00000000;
+                             psram_checksum <= 32'h00000000;
+                             psram_checksum_pass1 <= 32'h00000000;
+                             verify_pass <= 0;
+                             checksum_char_idx <= 0;
+                             checksum_write_phase <= 0;
+                             verify_bytes_left <= 0;
                         end
                     end
                 end
@@ -269,25 +374,27 @@ module cart_loader (
                          sd_rd <= 0; // Drop ACK when we see it was received
                      end
                      
-                     if (sd_ba_s && !sd_rd && !write_pending) begin
-                         sd_dout_reg <= sd_dout;     // Capture Data
+                     if (sd_ba_s && !sd_rd && !write_inflight) begin
+                         sd_dout_reg <= sd_dout_s;   // Capture synchronized data
                          sd_rd <= 1;                 // Assert ACK
                          sd_state <= SD_DATA;        // Handle PSRAM Write
-                     end else if (!sd_ba_s && !sd_rd && byte_index >= 512 && !write_pending) begin
+                     end else if (!sd_ba_s && !sd_rd && byte_index >= 512 && !write_inflight) begin
                          sd_state <= SD_NEXT;
-                     end else if (sd_ready_s && !sd_rd && byte_index < 512) begin
-                         sd_state <= SD_NEXT; // Abort on read error
                      end
                  end
                   
                   SD_DATA: begin
                          if (current_sector > 0) begin
                              // Handle Payload Sectors (Sector > 0)
-                             if (psram_load_addr[0] == 0) acc_word0[7:0] <= sd_dout_reg;
-                             else acc_word0[15:8] <= sd_dout_reg;
+                             load_checksum <= load_checksum + sd_dout_reg;
+                             if (psram_load_addr[0] == 0) begin
+                                 // Stage low byte explicitly so the high-byte word assembly is deterministic.
+                                 payload_lo_byte <= sd_dout_reg;
+                             end
                              
                              // Trigger Write on ODD byte
                              if (psram_load_addr[0] == 1'b1) begin
+                                  acc_word0 <= {sd_dout_reg, payload_lo_byte};
                                   write_pending <= 1;
                                   psram_write_addr_latched <= {psram_load_addr[22:1], 1'b0};
                              end
@@ -329,6 +436,7 @@ module cart_loader (
                              // Only use the V4+ SuperGame path when h64 is non-zero.
                              cart_rom_size       <= size_be_wire;
                              psram_load_addr     <= 23'h000000;       // Load full ROM from addr 0
+                             load_base_addr      <= 23'h000000;
                              // sector_limit = rom_size/512: loop reads exactly
                              // this many data sectors before stopping, so the
                              // last PSRAM write lands at ROM end (not 0x40000+).
@@ -352,6 +460,7 @@ module cart_loader (
                              // size_be_wire is always the correct interpretation.
                              cart_rom_size   <= size_be_wire;
                              psram_load_addr <= 49152 - size_be_wire;
+                             load_base_addr  <= 49152 - size_be_wire;
                              sector_limit    <= size_be_wire[18:9]; // rom_bytes / 512
                              // Flags: byte 53 = high flags, byte 54 = low flags
                              if      (h54[6]) begin cart_has_pokey <= 1; cart_pokey_addr <= 16'h0450; end
@@ -372,18 +481,91 @@ module cart_loader (
                   end
 
                   SD_DRAIN: begin
-                      // Wait ~400ns (32 cycles @ 81MHz) to ensure last write is committed
-                      drain_timer <= drain_timer + 1;
-                      if (drain_timer == 32) begin
-                          sd_state <= SD_COMPLETE;
-                          busy <= 0;
+                      // Only start readback verification after PSRAM write path is truly idle.
+                      // A fixed delay alone can race the final queued write pulse.
+                      if (!write_pending && !psram_wr_req && !psram_busy) begin
+                          drain_timer <= drain_timer + 1;
+                          if (drain_timer == 32) begin
+                              psram_checksum <= 32'h00000000;
+                                                            psram_checksum_pass1 <= 32'h00000000;
+                                                            verify_pass <= 0;
+                              verify_total_bytes <= {sector_limit, 9'b0};
+                              verify_bytes_left <= {sector_limit, 9'b0};
+                              psram_diag_rd_addr <= load_base_addr[21:0];
+                                                            checksum_write_phase <= 0;
+                              sd_state <= SD_VERIFY_START;
+                          end
+                      end else begin
+                          drain_timer <= 0;
                       end
                   end
+
+                 SD_VERIFY_START: begin
+                     if (verify_bytes_left == 0) begin
+                         checksum_char_idx <= 0;
+                        checksum_write_phase <= 0;
+                         sd_state <= SD_CSUM_WRITE;
+                     end else if (!psram_busy) begin
+                         psram_diag_rd_req <= 1;
+                         psram_diag_rd_addr <= psram_diag_rd_addr;
+                         sd_state <= SD_VERIFY_WAIT;
+                     end
+                 end
+
+                 SD_VERIFY_WAIT: begin
+                     if (psram_diag_rd_valid) begin
+                         if (verify_bytes_left <= 2) begin
+                             if (verify_pass == 0) begin
+                                 psram_checksum_pass1 <= psram_checksum + ((verify_bytes_left == 1) ? {24'b0, psram_diag_rd_data[7:0]} : ({24'b0, psram_diag_rd_data[7:0]} + {24'b0, psram_diag_rd_data[15:8]}));
+                                 verify_pass <= 1;
+                                 psram_checksum <= 32'h00000000;
+                                 verify_bytes_left <= verify_total_bytes;
+                                 psram_diag_rd_addr <= load_base_addr[21:0];
+                                 sd_state <= SD_VERIFY_START;
+                             end else begin
+                                 psram_checksum <= psram_checksum + ((verify_bytes_left == 1) ? {24'b0, psram_diag_rd_data[7:0]} : ({24'b0, psram_diag_rd_data[7:0]} + {24'b0, psram_diag_rd_data[15:8]}));
+                                 verify_bytes_left <= 0;
+                                 checksum_char_idx <= 0;
+                                 checksum_write_phase <= 0;
+                                 sd_state <= SD_CSUM_WRITE;
+                             end
+                         end else begin
+                             psram_checksum <= psram_checksum + {24'b0, psram_diag_rd_data[7:0]} + {24'b0, psram_diag_rd_data[15:8]};
+                             verify_bytes_left <= verify_bytes_left - 2;
+                             psram_diag_rd_addr <= psram_diag_rd_addr + 2;
+                             sd_state <= SD_VERIFY_START;
+                         end
+                     end
+                 end
+
+                 SD_CSUM_WRITE: begin
+                     bram_we <= 1;
+                     bram_addr <= ((checksum_write_phase == 0) ? 16'h6100 : ((checksum_write_phase == 1) ? 16'h6110 : 16'h6120)) + checksum_char_idx;
+                     bram_data <= checksum_char((checksum_write_phase == 0) ? load_checksum : ((checksum_write_phase == 1) ? psram_checksum_pass1 : psram_checksum), checksum_char_idx);
+                     if (checksum_char_idx == 4'd8) bram_data <= 8'h00;
+                     sd_state <= SD_CSUM_NEXT;
+                 end
+
+                 SD_CSUM_NEXT: begin
+                     if (checksum_char_idx < 4'd8) begin
+                         checksum_char_idx <= checksum_char_idx + 1;
+                         sd_state <= SD_CSUM_WRITE;
+                     end else begin
+                         if (checksum_write_phase < 2) begin
+                             checksum_write_phase <= checksum_write_phase + 1;
+                             checksum_char_idx <= 0;
+                             sd_state <= SD_CSUM_WRITE;
+                         end else begin
+                             sd_state <= SD_COMPLETE;
+                             busy <= 0;
+                         end
+                     end
+                 end
                  
                  SD_COMPLETE: begin
                      busy <= 0;
                      if (trigger_eval) begin
-                         if (!game_loaded && d_latched == 8'hA5) begin
+                         if (!DISABLE_GAME_HANDOFF && !game_loaded && d_latched == 8'hA5) begin
                              switch_pending <= 1;
                          end
                          else if (!game_loaded && (d_latched >= 8'h80 && d_latched <= 8'h8F) && !trigger_lock_active) begin
@@ -392,6 +574,14 @@ module cart_loader (
                              sd_state <= SD_START;
                              busy <= 1;
                              psram_load_addr <= 0;
+                             load_base_addr <= 23'h000000;
+                             load_checksum <= 32'h00000000;
+                             psram_checksum <= 32'h00000000;
+                             psram_checksum_pass1 <= 32'h00000000;
+                             verify_pass <= 0;
+                             checksum_char_idx <= 0;
+                             checksum_write_phase <= 0;
+                             verify_bytes_left <= 0;
                              trigger_lock_active <= 1;
                          end
                          else if (d_latched == 8'h5A) begin
@@ -401,6 +591,14 @@ module cart_loader (
                              busy <= 1;
                              game_loaded <= 0; 
                              switch_pending <= 0;
+                             load_base_addr <= 23'h000000;
+                             load_checksum <= 32'h00000000;
+                             psram_checksum <= 32'h00000000;
+                             psram_checksum_pass1 <= 32'h00000000;
+                             verify_pass <= 0;
+                             checksum_char_idx <= 0;
+                             checksum_write_phase <= 0;
+                             verify_bytes_left <= 0;
                          end
                      end
                      
@@ -415,7 +613,6 @@ module cart_loader (
                      // Read Block 1 + (Index * 1024)
                      // [FIX] Address is now pre-calculated to avoid race condition with sd_rd
                      byte_index <= 0;
-                     bram_we <= 0;
                      
                      if (sd_ready_s) begin
                          sd_rd <= 1;
@@ -427,17 +624,13 @@ module cart_loader (
                  end
                  
                  SD_SCAN_WAIT: begin
-                     bram_we <= 0; // Pulse low
                      if (sd_rd && !sd_ba_s) sd_rd <= 0;
                      
                      if (sd_ba_s && !sd_rd) begin
-                         sd_dout_reg <= sd_dout;
+                         sd_dout_reg <= sd_dout_s;
                          sd_rd <= 1;
                          sd_state <= SD_SCAN_DATA;
                      end else if (!sd_ba_s && !sd_rd && byte_index >= 512) begin
-                         sd_state <= SD_SCAN_NEXT;
-                     end else if (sd_ready_s && !sd_rd && byte_index < 512) begin
-                         // [FIX] Abort if controller goes IDLE prematurely (timeout/error)
                          sd_state <= SD_SCAN_NEXT;
                      end
                  end
@@ -457,14 +650,19 @@ module cart_loader (
                  end
                  
                  SD_SCAN_NEXT: begin
-                     if (scan_game_idx < 15) begin // Scan first 16 games
+                     if (scan_game_idx < 7) begin // Scan the 8 populated game slots
                          scan_game_idx <= scan_game_idx + 1;
                          sd_address <= 1 + ((scan_game_idx + 1) * 1024); // [FIX] Pre-calculate for next slot
                          sd_state <= SD_SCAN_START;
                      end else begin
-                         // Done scanning
-                         sd_state <= SD_IDLE;
-                         busy <= 0;
+                         // Done scanning; initialize checksum display area at $6100
+                         load_checksum <= 32'h00000000;
+                         psram_checksum <= 32'h00000000;
+                         psram_checksum_pass1 <= 32'h00000000;
+                         verify_pass <= 0;
+                         checksum_char_idx <= 0;
+                         checksum_write_phase <= 0;
+                         sd_state <= SD_CSUM_WRITE;
                      end
                  end
                  

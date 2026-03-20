@@ -12,6 +12,7 @@ Build a stable V2 multicart baseline on Tang 9K by reusing proven low-level bloc
 1. M2 integration build passed and generated Atari7800_AstroCart.fs for board validation.
 1. Hardware validation: AstroWing boots and runs from menu selection.
 1. Hardware validation: Choplifter selection loads quickly and game runs.
+1. M3 focused validation checklist created: .github/prompts/m3-focused-validation-checklist.prompt.md.
 
 **Phase-By-Phase Execution Checklist (Entry/Exit Gates)**
 
