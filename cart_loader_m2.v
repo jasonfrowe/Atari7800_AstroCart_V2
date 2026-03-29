@@ -90,14 +90,11 @@ module cart_loader (
     // -----------------------------------------------------------------------
     reg sd_ready_r1, sd_ready_s;    // synchronized sd_ready
     reg sd_ba_r1,    sd_ba_s;       // synchronized sd_byte_available
-    reg [7:0] sd_dout_r1, sd_dout_s; // synchronized sd_dout bus
     always @(posedge clk_sys) begin
         sd_ready_r1 <= sd_ready;
         sd_ready_s  <= sd_ready_r1;
         sd_ba_r1    <= sd_byte_available;
         sd_ba_s     <= sd_ba_r1;
-        sd_dout_r1  <= sd_dout;
-        sd_dout_s   <= sd_dout_r1;
     end
 
     // Simplified Sequential Loader
@@ -107,23 +104,18 @@ module cart_loader (
     localparam SD_DATA       = 3;
     localparam SD_NEXT       = 4;
     localparam SD_COMPLETE   = 5;
-    localparam SD_CSUM_WRITE = 6;
-    localparam SD_CSUM_NEXT  = 7;
-    localparam SD_VERIFY_START = 8;
     localparam SD_DRAIN      = 9; // Wait for last PSRAM write to commit
     
     localparam SD_SCAN_START = 10;
     localparam SD_SCAN_WAIT  = 11;
     localparam SD_SCAN_DATA  = 12;
     localparam SD_SCAN_NEXT  = 13;
-    localparam SD_VERIFY_WAIT = 14;
 
     // Internal tracking registers
     reg [9:0] current_sector;
     reg [9:0] byte_index;
 
     reg [7:0] sd_dout_reg;
-    reg [7:0] payload_lo_byte;
     reg [22:0] psram_load_addr;
     reg [7:0] d_latched;
     
@@ -131,7 +123,6 @@ module cart_loader (
     reg trigger_we_prev;
     reg trigger_eval;
     reg trigger_lock_active;
-    reg rewrite_pending;
     reg [7:0] drain_timer;
     reg [7:0] d_pipe [0:2];
     
@@ -149,9 +140,6 @@ module cart_loader (
     reg [9:0] sector_limit;
 
     wire [31:0] size_be_wire = {h49, h50, h51, h52}; // Always BE per .a78 spec
-    wire write_inflight = write_pending || psram_wr_req;
-
-
 
     always @(posedge clk_sys) begin
         if (reset) begin
@@ -169,12 +157,10 @@ module cart_loader (
              trigger_we_prev <= 0;
              trigger_eval <= 0;
              trigger_lock_active <= 0;
-             rewrite_pending <= 0;
              
              current_sector <= 0;
              psram_load_addr <= 23'h000000;
              sd_dout_reg <= 0;
-             payload_lo_byte <= 0;
              drain_timer <= 0;
              
              scan_game_idx <= 0;
@@ -190,23 +176,14 @@ module cart_loader (
              cart_sgm_fixed_bank <= 4'd15; // default: bank 15 (256KB)
              sector_limit <= 10'd96;      // will be overwritten in SD_NEXT
         end else begin
-                         bram_we <= 0;
              trigger_we_prev <= trigger_we;
              
-               if (psram_wr_req) begin
+             if (psram_wr_req) begin
                   psram_wr_req <= 0;
               end else if (write_pending && !psram_busy) begin
                    // [FIX] Gate writes when game loaded to prevent corruption
-                   if (!game_loaded) begin
-                       psram_wr_req <= 1;
-                       rewrite_pending <= 1;  // queue a second write at same addr/data
-                   end
-                   write_pending <= 0;
-              end else if (rewrite_pending && !psram_busy) begin
-                   // Second write: acc_word0 and psram_write_addr_latched are
-                   // still valid — even bytes only touch payload_lo_byte.
                    if (!game_loaded) psram_wr_req <= 1;
-                   rewrite_pending <= 0;
+                   write_pending <= 0;
               end
              
               // Keep a history of the unsynchronized data bus 'd'
@@ -292,26 +269,25 @@ module cart_loader (
                          sd_rd <= 0; // Drop ACK when we see it was received
                      end
                      
-                     if (sd_ba_s && !sd_rd && !write_inflight) begin
-                         sd_dout_reg <= sd_dout_s;   // Capture synchronized data
+                     if (sd_ba_s && !sd_rd && !write_pending) begin
+                         sd_dout_reg <= sd_dout;     // Capture Data
                          sd_rd <= 1;                 // Assert ACK
                          sd_state <= SD_DATA;        // Handle PSRAM Write
-                     end else if (!sd_ba_s && !sd_rd && byte_index >= 512 && !write_inflight) begin
+                     end else if (!sd_ba_s && !sd_rd && byte_index >= 512 && !write_pending) begin
                          sd_state <= SD_NEXT;
+                     end else if (sd_ready_s && !sd_rd && byte_index < 512) begin
+                         sd_state <= SD_NEXT; // Abort on read error
                      end
                  end
                   
                   SD_DATA: begin
                          if (current_sector > 0) begin
                              // Handle Payload Sectors (Sector > 0)
-                             if (psram_load_addr[0] == 0) begin
-                                 // Stage low byte explicitly so the high-byte word assembly is deterministic.
-                                 payload_lo_byte <= sd_dout_reg;
-                             end
+                             if (psram_load_addr[0] == 0) acc_word0[7:0] <= sd_dout_reg;
+                             else acc_word0[15:8] <= sd_dout_reg;
                              
                              // Trigger Write on ODD byte
                              if (psram_load_addr[0] == 1'b1) begin
-                                  acc_word0 <= {sd_dout_reg, payload_lo_byte};
                                   write_pending <= 1;
                                   psram_write_addr_latched <= {psram_load_addr[22:1], 1'b0};
                              end
@@ -396,18 +372,14 @@ module cart_loader (
                   end
 
                   SD_DRAIN: begin
-                      // Wait to ensure last write is committed
-                      if (!write_pending && !rewrite_pending && !psram_wr_req && !psram_busy) begin
-                          drain_timer <= drain_timer + 1;
-                          if (drain_timer == 32) begin
-                              sd_state <= SD_COMPLETE;
-                              busy <= 0;
-                          end
-                      end else begin
-                          drain_timer <= 0;
+                      // Wait ~400ns (32 cycles @ 81MHz) to ensure last write is committed
+                      drain_timer <= drain_timer + 1;
+                      if (drain_timer == 32) begin
+                          sd_state <= SD_COMPLETE;
+                          busy <= 0;
                       end
                   end
-                  
+                 
                  SD_COMPLETE: begin
                      busy <= 0;
                      if (trigger_eval) begin
@@ -443,6 +415,7 @@ module cart_loader (
                      // Read Block 1 + (Index * 1024)
                      // [FIX] Address is now pre-calculated to avoid race condition with sd_rd
                      byte_index <= 0;
+                     bram_we <= 0;
                      
                      if (sd_ready_s) begin
                          sd_rd <= 1;
@@ -454,13 +427,17 @@ module cart_loader (
                  end
                  
                  SD_SCAN_WAIT: begin
+                     bram_we <= 0; // Pulse low
                      if (sd_rd && !sd_ba_s) sd_rd <= 0;
                      
                      if (sd_ba_s && !sd_rd) begin
-                         sd_dout_reg <= sd_dout_s;
+                         sd_dout_reg <= sd_dout;
                          sd_rd <= 1;
                          sd_state <= SD_SCAN_DATA;
                      end else if (!sd_ba_s && !sd_rd && byte_index >= 512) begin
+                         sd_state <= SD_SCAN_NEXT;
+                     end else if (sd_ready_s && !sd_rd && byte_index < 512) begin
+                         // [FIX] Abort if controller goes IDLE prematurely (timeout/error)
                          sd_state <= SD_SCAN_NEXT;
                      end
                  end
@@ -480,7 +457,7 @@ module cart_loader (
                  end
                  
                  SD_SCAN_NEXT: begin
-                     if (scan_game_idx < 7) begin // Scan the 8 populated game slots
+                     if (scan_game_idx < 15) begin // Scan first 16 games
                          scan_game_idx <= scan_game_idx + 1;
                          sd_address <= 1 + ((scan_game_idx + 1) * 1024); // [FIX] Pre-calculate for next slot
                          sd_state <= SD_SCAN_START;

@@ -49,6 +49,7 @@ module top (
     reg [15:0] a_safe;
     reg phi2_safe;
     reg rw_safe;
+    reg halt_safe;
 
     // NEW: Glitch Filter for Address Bus
     reg [15:0] a_delay;
@@ -59,6 +60,7 @@ module top (
         a_safe    <= a;
         phi2_safe <= phi2;
         rw_safe   <= rw;
+        halt_safe <= halt;
         
         // Only accept the address if it hasn't changed for 2 clock ticks (~50ns)
         a_delay <= a_safe;
@@ -113,35 +115,20 @@ module top (
 
     // Bank register — CPU write to $8000-$BFFF latches d[3:0] as the bank
     // number for the switchable window.  Held at 0 until PLL locks.
-    // Use a small history of the CPU data bus because a_stable/rw_safe/phi2_safe
-    // are delayed through synchronizers/glitch filters. By the time the qualified
-    // write pulse is observed, the live bus may already have moved on.
     reg [3:0] bank_reg;
     wire sgm_bank_we = is_sgm && game_loaded && !rw_safe && phi2_safe
                        && (a_stable[15:14] == 2'b10); // any addr $8000-$BFFF
-    reg sgm_bank_we_prev;
-    reg [7:0] cpu_d_pipe [0:2];
     always @(posedge sys_clk) begin
-        cpu_d_pipe[0] <= d;
-        cpu_d_pipe[1] <= cpu_d_pipe[0];
-        cpu_d_pipe[2] <= cpu_d_pipe[1];
-        sgm_bank_we_prev <= sgm_bank_we;
-
         if (!pll_lock || !game_loaded) bank_reg <= 4'd0;  // clear on power-on AND between game loads
-        else if (sgm_bank_we_prev && !sgm_bank_we) bank_reg <= cpu_d_pipe[2][3:0];
+        else if (sgm_bank_we) bank_reg <= d[3:0];
     end
 
     // SGM read-address mux
-    //   $4000-$7FFF  →  PSRAM 0x40000 + a[13:0] only when RAM-at-4000 is enabled
+    //   $4000-$7FFF  →  PSRAM 0x40000 + a[13:0]        (16KB RAM, above ROM)
     //   $8000-$BFFF  →  PSRAM bank_reg*16K + a[13:0]   (switchable ROM bank)
     //   $C000-$FFFF  →  PSRAM cart_sgm_fixed_bank*16K  (fixed last bank)
-    // For supercart titles without RAM-at-4000, reads from $4000-$7FFF are
-    // not backed by the PSRAM RAM window. Returning RAM-window garbage there
-    // breaks titles like Commando, so we avoid treating that range as RAM.
     wire [21:0] psram_sgm_addr =
-        (a_stable[15:14] == 2'b01) ? (cart_ram_at_4000
-                                        ? {4'b0001, 4'b0000, a_stable[13:0]}
-                                        : {4'b0000, cart_sgm_fixed_bank, a_stable[13:0]}) :
+        (a_stable[15:14] == 2'b01) ? {4'b0001, 4'b0000,           a_stable[13:0]} :
         (a_stable[15:14] == 2'b10) ? {4'b0000, bank_reg,           a_stable[13:0]} :
                                      {4'b0000, cart_sgm_fixed_bank, a_stable[13:0]};
 
@@ -193,7 +180,6 @@ module top (
     wire is_rom   = (a_stable[15] | a_stable[14]);               // $4000-$FFFF
     wire is_pokey = cart_has_pokey && (a_stable[15:4] == cart_pokey_addr[15:4]);
     wire is_2200  = (a_stable == 16'h2200) && !game_loaded;    // $2200 (Menu Control disabled in game)
-    wire sgm_unmapped_4000 = is_sgm && !cart_ram_at_4000 && (a_stable[15:14] == 2'b01) && !is_pokey;
 
     // ========================================================================
     // 3. BUS ARBITRATION
@@ -296,6 +282,7 @@ module top (
     // PSRAM Interface Signals
     // --- Clock Domain Crossing (CDC) ---
     // [OPTIMIZATION] Removed CDC logic as sys_clk is now 81MHz (same as PSRAM)
+    wire psram_cmd_write = psram_wr_req;
     wire psram_cmd_read  = psram_rd_req;
     
     // Synchronize 81MHz Busy -> 27MHz Safe Level
@@ -364,21 +351,21 @@ module top (
     // Using a registered word buffer instead causes a 12-15 cycle startup window
     // where the buffer is 0x00, making the CPU read BRK as the reset vector.
     always @* begin
-        if (sgm_unmapped_4000) ip_data_buffer = 8'hFF;
-        else ip_data_buffer = psram_cmd_addr[0] ? psram_dout_16[15:8] : psram_dout_16[7:0];
+        ip_data_buffer = psram_cmd_addr[0] ? psram_dout_16[15:8] : psram_dout_16[7:0];
     end
 
     // PSRAM Read/Write Logic
     reg [15:0] last_req_addr;
+    reg game_loaded_d;
     // switch_pending_prev removed — pre-fetch is now level-sensitive (see below)
     
     always @(posedge sys_clk) begin
+        game_loaded_d <= game_loaded;
+        
         if (sd_reset) begin
-            psram_rd_req <= 0;
             last_req_addr <= 16'hFFFF;
             prefetch_active <= 0;
         end else begin
-
             // ---------------------------------------------------------------
             // RESET-VECTOR PRE-FETCH  (level-sensitive retry)
             // Keep trying on every cycle that switch_pending=1 and PSRAM is
@@ -408,7 +395,7 @@ module top (
             // Gate on !sgm_wr_pending and !sgm_do_write_r to prevent read/write
             // conflicts on the cycle the SGM write pulse fires.
             // ---------------------------------------------------------------
-            end else if (game_loaded && !sgm_wr_pending && !sgm_do_write_r && !sgm_unmapped_4000 &&
+            end else if (game_loaded && !sgm_wr_pending && !sgm_do_write_r &&
                 (a_stable[15] | a_stable[14]) && !psram_busy &&
                 a_stable != last_req_addr) begin
                 psram_rd_req <= 1;
@@ -426,6 +413,7 @@ module top (
         end
     end
 
+    
     // Capture Read Data
     // Note: read_data from controller is stable until next read.
     // We can just update psram_latched_data when busy falls?
@@ -507,8 +495,5 @@ module top (
     // High-speed 1.8V outputs for accurate timing measurement
     assign debug_pin1 = psram_rd_req;     // Probe 1: Start of Read Request
     assign debug_pin2 = !psram_busy; // Probe 2: Data return from PSRAM IP
-
-    wire unused_top_signals = irq ^ halt ^ (^sd_state) ^ (^cart_rom_size) ^ (^cart_pokey_addr[3:0]) ^ psram_write_addr_latched[22] ^ psram_cmd_addr[22];
-    wire _unused_top_keep = unused_top_signals & 1'b0;
     
 endmodule

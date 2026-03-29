@@ -179,20 +179,13 @@ flash_loop
 wait_loop
  restorescreen
  gosub draw_hud
- plotchars 'LOADING...' 1 96 14
  drawscreen
- status_temp = 0
  asm
    lda $7FF0
-   sta status_temp
+   bpl .keep_waiting
+   lda #$A5
+   sta $2200
+   jmp ($FFFC)
+.keep_waiting
 end
- if status_temp < 128 then goto wait_loop
-
-inspect_loop
- restorescreen
- gosub draw_hud
- plotchars 'LOAD DONE' 1 96 14
- plotchars 'COMMANDO TEST' 1 72 16
- plotchars 'POWER CYCLE TO EXIT' 1 40 18
- drawscreen
- goto inspect_loop
+ goto wait_loop
