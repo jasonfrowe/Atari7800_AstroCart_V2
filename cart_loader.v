@@ -147,6 +147,7 @@ module cart_loader (
     reg trigger_we_prev;
     reg trigger_eval;
     reg trigger_lock_active;
+    reg rewrite_pending;
     reg [7:0] drain_timer;
     reg [7:0] d_pipe [0:2];
     
@@ -226,6 +227,7 @@ module cart_loader (
              trigger_we_prev <= 0;
              trigger_eval <= 0;
              trigger_lock_active <= 0;
+             rewrite_pending <= 0;
              
              current_sector <= 0;
              psram_load_addr <= 23'h000000;
@@ -263,8 +265,16 @@ module cart_loader (
                   psram_wr_req <= 0;
               end else if (write_pending && !psram_busy) begin
                    // [FIX] Gate writes when game loaded to prevent corruption
-                   if (!game_loaded) psram_wr_req <= 1;
+                   if (!game_loaded) begin
+                       psram_wr_req <= 1;
+                       rewrite_pending <= 1;  // queue a second write at same addr/data
+                   end
                    write_pending <= 0;
+              end else if (rewrite_pending && !psram_busy) begin
+                   // Second write: acc_word0 and psram_write_addr_latched are
+                   // still valid — even bytes only touch payload_lo_byte.
+                   if (!game_loaded) psram_wr_req <= 1;
+                   rewrite_pending <= 0;
               end
              
               // Keep a history of the unsynchronized data bus 'd'
